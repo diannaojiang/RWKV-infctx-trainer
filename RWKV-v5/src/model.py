@@ -1,125 +1,12 @@
-########################################################################################################
+### ---
 # The RWKV Language Model - https://github.com/BlinkDL/RWKV-LM
-########################################################################################################
+### ---
 
-import gc, math, os
-from random import randint
-from typing import List, Optional
+global RWKV_JIT_ON, RWKV_TORCH_COMPILE, RWKV_NO_CUDA
 
-import numpy as np
-import torch
-# torch._C._jit_set_profiling_executor(True)
-# torch._C._jit_set_profiling_mode(True)
-import torch.nn as nn
-from torch.nn import functional as F
-
-import lightning as L
-from lightning.pytorch.utilities import rank_zero_info, rank_zero_only
-from lightning.pytorch.strategies import DeepSpeedStrategy
-
-import deepspeed
-from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
-import deepspeed.runtime.lr_schedules
-import wandb
-
-from torch.utils.cpp_extension import load
-
-# Script dir for various files
-SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
-CUDA_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "../cuda"))
-
-########################################################################################################
-# JIT / torch compile special handling
-########################################################################################################
-
-# Currently the features we need for torch compile, is avaliable only in
-# 2.1 nightly build (and is expected to be in 2.1 official release)
-#
-# However because the nightly build torch.compile behaviour has been unstable
-# the versioning code to check for enabling toch compile will not be used, 
-# until we confirm a stable version of torch.compile
-from packaging import version
-def is_torch_version_above(required_version):
-    torch_version = version.parse(torch.__version__.split('+')[0])
-    return torch_version >= version.parse(required_version)
-IS_TORCH_2_1 = is_torch_version_above("2.0.9999")
-
-# Get the JIT / torch compile option flags from the environment
-RWKV_JIT_ON        = os.getenv("RWKV_JIT_ON", "1").lower() in ("1", "true", "yes")
-RWKV_TORCH_COMPILE = os.getenv("RWKV_TORCH_COMPILE", f"0").lower() in ("1", "true", "yes")
-RWKV_TORCH_RUN_MODE = None
-
-# We enable JITMod*/Function when supporting torch.jit
-# We use TorchCompile* when supporting torch compile
-# based on the current runtime settings
-if RWKV_TORCH_COMPILE:
-    RWKV_TORCH_RUN_MODE = "torch-compile"
-
-    JITModClass  = nn.Module
-    JITModMethod = lambda x: x
-    JITFunction  = lambda x: x
-
-    # PS: i have tried mode="max-autotune", and mode="reduce-overhead", however they crash
-    #     for now (8th July 2023). I may introduce them in the future once they are stable
-    #
-    #     Additionally, torch.compile has issues with the pytorch.lightning module directly
-    # ---
-
-    # We generally have 2 major options, either we use torch.compile
-    # onto the key top level functions (train, val, test, predict, etc)
-    # and let the compiler handle all the decision making on how to optimize
-    #
-    # However this was found to basically just match JIT level of performance exactly
-    # ---
-    # TCompileMax          = lambda x: x
-    # TCompileBaseline     = lambda x: torch.compile(x, fullgraph=False)
-
-    # Alternatively, we can perform a much more aggressive optimization on critical functions
-    # that we know are compatible with torch.compile(fullgraph=True) - which provides the highest
-    # level of optimization possible with torch.compile
-    # ---
-    TCompileMax        = lambda x: torch.compile(x, fullgraph=True)
-    TCompileBaseline   = lambda x: x
-
-    # ---
-    # Because torch.compile is expected to change overtime, the two options should 
-    # be tested every now and then, for any performance changes
-    #
-    # and we should switch over to the broaded automated approach if its "faster"
-    # ---
-
-    # Used to wrap functions which are **not** torch.compile compatible
-    TCompileDisable    = torch._dynamo.disable
-
-    # The following are known warnings in the nightly build, that can be safely ignored for stable release
-    #
-    # `torch._inductor.utils: [WARNING] DeviceCopy in input program` 
-    # https://discuss.pytorch.org/t/what-can-cause-warning-devicecopy-in-input-program/175566
-
-elif RWKV_JIT_ON:
-    RWKV_TORCH_RUN_MODE = "torch-jit"
-    JITModClass  = torch.jit.ScriptModule
-    JITModMethod = torch.jit.script_method
-    JITFunction  = torch.jit.script
-
-    # JITModClass  = nn.Module
-    # JITModMethod = lambda x: x
-    # JITFunction  = lambda x: x
-
-    TCompileMax        = lambda x: x
-    TCompileBaseline   = lambda x: x
-    TCompileDisable    = lambda x: x
-else:
-    RWKV_TORCH_RUN_MODE = "torch-native"
-    JITModClass  = nn.Module
-    JITModMethod = lambda x: x
-    JITFunction  = lambda x: x
-
-    TCompileMax        = lambda x: x
-    TCompileBaseline   = lambda x: x
-    TCompileDisable    = lambda x: x
-
-print(f"[RWKV.model] Running RWKV model using '{RWKV_TORCH_RUN_MODE}' with torch '{torch.__version__}'")
+from .module.CoreDependencies import *
+from .module.ChannelMix import RWKV_ChannelMix
+from .module.TimeMix import RWKV_TimeMix
 
 # ---
 # Isolating out known operations that **does not work** with torch.compile
@@ -127,31 +14,20 @@ print(f"[RWKV.model] Running RWKV model using '{RWKV_TORCH_RUN_MODE}' with torch
 # the baseline torc.compile to work
 # ---
 
+# In the latest version of deepspeed + torch compile,
+# deepspeed.checkpointing now works ? - this is inconsistent, so i am disabling for now
 @TCompileDisable
 def deepspeed_checkpoint(*args, **kwargs):
     return deepspeed.checkpointing.checkpoint(*args, **kwargs)
 
-########################################################################################################
+### ---
 # RWKV: State Blocks
-########################################################################################################
-
-class TimeMixState:
-
-    def __init__(self, shift_state: torch.Tensor, wkv_state: torch.Tensor):
-        self.shift_state = shift_state
-        self.wkv_state = wkv_state
-
-
-class ChannelMixState:
-
-    def __init__(self, shift_state: torch.Tensor):
-        self.shift_state = shift_state
-
+### ---
 
 class BlockState:
 
-    def __init__(self, time_mix_state: TimeMixState,
-                 channel_mix_state: ChannelMixState):
+    def __init__(self, time_mix_state: tuple[torch.Tensor,torch.Tensor],
+                 channel_mix_state: torch.Tensor):
         self.time_mix_state = time_mix_state
         self.channel_mix_state = channel_mix_state
 
@@ -176,6 +52,7 @@ class BlockStateList:
     def empty(N, B, C, n_head, head_size, device, dtype):
         # @TODO: confirm if dtype can be changed from .flaot to dtype=dtype (when bf16)
         wkv_states = torch.empty((N, B, n_head, head_size, head_size),
+        # wkv_states = torch.empty((N, B, 1, n_head, head_size, head_size),
                                  device=device,
                                 #  dtype=dtype)
                                  dtype=torch.float)
@@ -184,224 +61,17 @@ class BlockStateList:
 
     def __getitem__(self, layer: int):
         return BlockState(
-            TimeMixState(self.shift_states[layer, 0], self.wkv_states[layer]),
-            ChannelMixState(self.shift_states[layer, 1]))
+            (self.shift_states[layer, 0], self.wkv_states[layer]),
+            (self.shift_states[layer, 1]))
 
     def __setitem__(self, layer: int, state: BlockState):
-        self.shift_states[layer, 0] = state.time_mix_state.shift_state
-        self.wkv_states[layer] = state.time_mix_state.wkv_state
-        self.shift_states[layer, 1] = state.channel_mix_state.shift_state
+        self.shift_states[layer, 0] = state.time_mix_state[0]
+        self.wkv_states[layer] = state.time_mix_state[1]
+        self.shift_states[layer, 1] = state.channel_mix_state
 
-########################################################################################################
-# RWKV: RWKV Time-mix + RWKV Channel-mix
-########################################################################################################
-
-class RWKV_TimeMix(JITModClass):
-
-    def __init__(self, layer_id, n_layer, n_embd, n_head, head_size, dim_att):
-        super().__init__()
-        
-        self.dim_att = dim_att
-        self.n_layer = n_layer
-        self.n_embd = n_embd
-        self.layer_id = layer_id
-
-        self.n_head = n_head
-        self.head_size = head_size
-
-        # Optimized chunk length is fixed for now
-        self.chunk_len = 512
-        # assert ctx_len % self.chunk_len == 0
-
-        with torch.no_grad():  # fancy init
-            ratio_0_to_1 = layer_id / (n_layer - 1)  # 0 to 1
-            ratio_1_to_almost0 = 1.0 - (layer_id / n_layer)  # 1 to ~0
-            ddd = torch.ones(1, 1, n_embd)
-            for i in range(n_embd):
-                ddd[0, 0, i] = i / n_embd
-
-            # fancy time_mix
-            self.time_mix_k = nn.Parameter(torch.pow(ddd, ratio_1_to_almost0))
-            self.time_mix_v = nn.Parameter(torch.pow(ddd, ratio_1_to_almost0) + 0.3 * ratio_0_to_1)
-            self.time_mix_r = nn.Parameter(torch.pow(ddd, 0.5 * ratio_1_to_almost0))
-
-            # R3 changes
-            self.time_mix_g = nn.Parameter(torch.pow(ddd, 0.5 * ratio_1_to_almost0))
-            self.gate = nn.Linear(n_embd, dim_att, bias=False)
-
-            # fancy time_decay
-            decay_speed = torch.ones(n_head)
-            for h in range(n_head):
-                decay_speed[h] = -8 + 7 * (h / (n_head - 1)) ** (0.7 + 1.3 * ratio_0_to_1)
-            self.time_decay = nn.Parameter(decay_speed)
-            # print(layer_id, self.time_decay.flatten()[:3].cpu().numpy(), '...', self.time_decay.flatten()[-3:].cpu().numpy())
-
-            # V5-R2 changes
-            self.time_faaaa = nn.Parameter(torch.ones(n_head) * 0.05)
-            # self.time_first = nn.Parameter(torch.ones(n_head) * (-3.0))
-
-        # self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
-        self.receptance = nn.Linear(n_embd, dim_att, bias=False)
-        self.key = nn.Linear(n_embd, dim_att, bias=False)
-        self.value = nn.Linear(n_embd, dim_att, bias=False)
-        self.output = nn.Linear(dim_att, n_embd, bias=False)
-        self.ln_x = nn.GroupNorm(n_head, dim_att)
-
-    # this is based on jit_func(self,x)
-    @JITModMethod
-    def _forward_rkv_chunk(self, x, B, TT, last_state: TimeMixState):
-        # Mix x with the previous timestep to produce xk, xv, xr
-        xx = torch.concat((last_state.shift_state.unsqueeze(1), x[:, :-1]), dim=1)
-        # xx = self.time_shift(x)
-
-        xk = x * self.time_mix_k + xx * (1 - self.time_mix_k)
-        xv = x * self.time_mix_v + xx * (1 - self.time_mix_v)
-        xr = x * self.time_mix_r + xx * (1 - self.time_mix_r)
-        xg = x * self.time_mix_g + xx * (1 - self.time_mix_g)
-
-        r = self.receptance(xr).view(B, TT, self.n_head, self.head_size).transpose(1, 2)            # BTC -> BHTS
-        k = self.key(xk).view(B, TT, self.n_head, self.head_size).transpose(1, 2).transpose(-2, -1) # BTC -> BHTS -> BHST
-        v = self.value(xv).view(B, TT, self.n_head, -1).transpose(1, 2)                             # BTC -> BHTS
-        g = F.silu(self.gate(xg))
-
-        return r, k, v, g
-
-    def _forward_wkbs_chunk(self, T, r, k, v):
-        H = self.n_head
-
-        w = torch.exp(-torch.exp(self.time_decay.float())).unsqueeze(-1)
-
-        # V5-R2 changes
-        u = self.time_faaaa.float().unsqueeze(-1)
-        # u = torch.exp(self.time_first.float()).unsqueeze(-1)
-
-        ws = w.pow(T).reshape(1, H, 1, 1)
-        ind = torch.arange(T-1, -1, -1, device=r.device).unsqueeze(0).repeat(H, 1)
-        w = w.repeat(1, T).pow(ind)
-
-        wk = w.reshape(1, H, 1, T)
-        wb = wk.transpose(-2, -1).flip(2)
-
-        w = torch.cat([w[:, 1:], u], dim=1)
-        w = F.pad(w, (0, T))
-        w = torch.tile(w, [T])
-        w = w[:, :-T].reshape(-1, T, 2 * T - 1)
-        w = w[:, :, T-1:].reshape(1, H, T, T)
-
-        w = w.to(dtype=r.dtype)
-        wk = wk.to(dtype=r.dtype)
-        wb = wb.to(dtype=r.dtype)
-        ws = ws.to(dtype=r.dtype)
-
-        return w, wk, wb, ws
-
-    @JITModMethod
-    def _forward_state_chunk(self, r, k, v, g, w, wk, wb, ws, x_l, last_state: TimeMixState):
-        B, H, TT, S = r.size()
-        T = TT
-
-        # s = torch.zeros(B, H, S, S, device=r.device, dtype=r.dtype)  # state
-        s = last_state.wkv_state
-        if r.dtype == torch.bfloat16 and s.dtype != torch.bfloat16:
-            s = s.contiguous().to(torch.bfloat16)
-
-        x = torch.zeros(B, H, TT, S, device=r.device, dtype=r.dtype) # output
-
-        ########################################################################
-        for i in range(TT // T):
-        
-            rr = r[:, :, i*T:i*T+T, :]
-            kk = k[:, :, :, i*T:i*T+T]
-            vv = v[:, :, i*T:i*T+T, :]
-
-            x[:, :, i*T:i*T+T, :] = ((rr @ kk) * w) @ vv + (rr @ s) * wb
-
-            s = ws * s + (kk * wk) @ vv
-        ########################################################################
-        
-        x = x.transpose(1, 2).contiguous().view(B * TT, H*S) # BHTS -> BTHS -> BTC
-
-        # x = self.ln_x(x/self.head_size_divisor).view(B, TT, H*S)
-        x = self.ln_x(x/8).view(B, TT, H*S)
-
-        # Fix missing *g for output as per :
-        # https://github.com/RWKV/RWKV-infctx-trainer/commit/beb46d599042b77d53db9c7fa59a5966e7d33719#r126730367
-        return self.output(x*g), TimeMixState(x_l, s)
-    
-    def _forward_chunk(self, x, last_state: TimeMixState):
-        # Forward sizings (Batch, Time/ContextLength, Tokens)
-        B, TT, C = x.size()
-        B = torch.tensor(B, device=x.device, dtype=torch.int32)
-        TT = torch.tensor(TT, device=x.device, dtype=torch.int32)
-
-        # Get r, k, v, g (self.jit_func(x))
-        r, k, v, g = self._forward_rkv_chunk(x, B, TT, last_state)
-
-        # Get w, wk, wb, ws (self.jit_func_2)
-        w, wk, wb, ws = self._forward_wkbs_chunk(TT, r, k, v)
-
-        # Does the state forwarding
-        return self._forward_state_chunk(r, k, v, g, w, wk, wb, ws, x[:, -1], last_state)
-
-    @TCompileMax
-    def forward(self, x, last_state: TimeMixState):
-        # Get the x sizing
-        B, TT, C = x.size()
-
-        # Chunk length to split by, 
-        # we probably can reoptimize this at some point
-        chunk_len = self.chunk_len
-
-        # Logits to return
-        x_logits = torch.zeros(B, TT, C, device=x.device, dtype=x.dtype)
-
-        # Split the input by TT chunks
-        for i in range(0, TT, chunk_len):
-            x_chunk = x[:, i:i+chunk_len, :]
-            chunk_logits, last_state = self._forward_chunk(x_chunk, last_state)
-            x_logits[:, i:i+chunk_len, :] = chunk_logits
-
-        # Return the logits and the state
-        return x_logits, last_state
-
-
-########################################################################################################
-
-
-class RWKV_ChannelMix(JITModClass):
-
-    def __init__(self, layer_id, n_layer, n_embd, dim_ffn):
-        super().__init__()
-
-        with torch.no_grad():  # fancy init of time_mix
-            ratio_1_to_almost0 = 1.0 - (layer_id / n_layer)  # 1 to ~0
-            ddd = torch.ones(1, 1, n_embd)
-            for i in range(n_embd):
-                ddd[0, 0, i] = i / n_embd
-            self.time_mix_k = nn.Parameter(torch.pow(ddd, ratio_1_to_almost0))
-            self.time_mix_r = nn.Parameter(torch.pow(ddd, ratio_1_to_almost0))
-
-        self.key = nn.Linear(n_embd, dim_ffn, bias=False)
-        self.receptance = nn.Linear(n_embd, n_embd, bias=False)
-        self.value = nn.Linear(dim_ffn, n_embd, bias=False)
-
-    @JITModMethod
-    @TCompileMax
-    def forward(self, x, last_state: ChannelMixState):
-        xx = torch.concat((last_state.shift_state.unsqueeze(1), x[:, :-1]),
-                          dim=1)
-        xk = x * self.time_mix_k + xx * (1 - self.time_mix_k)
-        xr = x * self.time_mix_r + xx * (1 - self.time_mix_r)
-        k = self.key(xk)
-        k = torch.relu(k) ** 2
-        kv = self.value(k)
-        return (torch.sigmoid(self.receptance(xr)) * kv,
-                ChannelMixState(x[:, -1]))
-
-
-########################################################################################################
+### ---
 # The RWKV Model blocks
-########################################################################################################
+### ---
 
 class Block(nn.Module):
 
@@ -465,34 +135,34 @@ class L2Wrap(torch.autograd.Function):
         #
         # See also:
         # - checkpointed_step
-        ctx.save_for_backward(y)
-        ctx.token_amount = token_amount
-        ctx.currentMask = currentMask
+        ctx.save_for_backward(y, token_amount, currentMask)
         return loss
 
     @staticmethod
     def backward(ctx, grad_output):
-        y, = ctx.saved_tensors
-        token_amount = ctx.token_amount
+        y, token_amount, currentMask = ctx.saved_tensors
+
         # to encourage the logits to be close to 0
         factor = 1e-4 / token_amount
         maxx, ids = torch.max(y, -1, keepdim=True)
         gy = torch.zeros_like(y)
         gy.scatter_(-1, ids, maxx * factor)
-        gy = gy * ctx.currentMask[:, None][None, :]
+
+        # We ensure the mask is reshaped accordingly, and apply it against gy
+        gy = gy * currentMask.reshape(gy.shape[0],gy.shape[1],1) # currentMask[:, None][None, :]
         return (grad_output, gy, None, None)
 
-########################################################################################################
+### ---
 # Static optimized functions
-########################################################################################################
+### ---
 
 # @ TCompileMax (no speed improvement)
 # def F_cross_entropy_reduction_none_optimized(logits, targets):
 #     return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), reduction="none")
 
-########################################################################################################
+### ---
 # Core RWKV module
-########################################################################################################
+### ---
 class RWKV(L.LightningModule):
 
     def __init__(self,
@@ -530,7 +200,7 @@ class RWKV(L.LightningModule):
                  grad_cp: bool = True,
                  bptt_learning: bool = True,
                  bptt_learning_range: int = -1,
-                 bptt_truncated_learning: bool = False,
+                 bptt_truncated_learning: bool = True,
                  layerwise_lr: bool = True,
                  dim_att: Optional[int] = None,
                  dim_ffn: Optional[int] = None,
@@ -561,7 +231,10 @@ class RWKV(L.LightningModule):
                 raise ValueError(f"load_model file '{load_model}' does not exist")
 
             # Load the model weights
-            model_weights = torch.load(load_model, map_location='cpu')
+            if IS_TORCH_2_1_COMPATIBLE:
+                model_weights = torch.load(load_model, map_location='cpu', weights_only=True, mmap=True)
+            else:
+                model_weights = torch.load(load_model, map_location='cpu')
 
             # Get the model keys
             model_keys = list(model_weights.keys())
@@ -606,6 +279,16 @@ class RWKV(L.LightningModule):
         self.substep_cuda_cache_clear = substep_cuda_cache_clear
         self.substep_logging = substep_logging
 
+        # Add warning that bptt_truncated_learning is forced to be true
+        # due to incomplete implementation of CUDA kernel for bptt_learning
+        #
+        # @TODO : remove this warning once the CUDA kernel, with state gradient, is implemented
+        if self.bptt_truncated_learning == False:
+            print("====================================================================")
+            print("[WARNING]: bptt_truncated_learning is set as true (was configured as false), due to incomplete implementation of CUDA kernel for bptt_learning")
+            print("====================================================================")
+            self.bptt_truncated_learning = True
+
         # Save the position loss params
         self.position_loss_bias = position_loss_bias
         self.position_loss_bias_in_validation = position_loss_bias_in_validation
@@ -632,7 +315,6 @@ class RWKV(L.LightningModule):
         # Matmu precision check
         if torch_set_float32_matmul_precision is not None:
             torch.set_float32_matmul_precision(torch_set_float32_matmul_precision)
-
         self.emb = nn.Embedding(vocab_size, n_embd)
 
         # load(name=f"wkv_{self.ctx_len}_bf16",
@@ -665,6 +347,10 @@ class RWKV(L.LightningModule):
             self.load_state_dict(model_weights)
             del model_weights
             gc.collect()
+
+        # Training based timings to track, and initialize
+        self._counting_tokens = 0
+        self._counting_time_start = 0
 
     def configure_optimizers(self):
         if self.bptt_learning == False:
@@ -919,6 +605,13 @@ class RWKV(L.LightningModule):
         else:
             cur_bs_list = BlockStateList(last_shift_states, last_wkv_states)
 
+        ## The output X token
+        output_x = x
+
+        ########
+        ### Non forking block loop
+        #######
+
         # Avoid using the zip operation, as torch.compile throws an exception on it
         # with `zip not reconized as a valid function`
         # ---
@@ -930,17 +623,116 @@ class RWKV(L.LightningModule):
             block = self.blocks[i]
             last_state = cur_bs_list[i]
             if self.grad_cp:
-                x, new_state = deepspeed_checkpoint(
-                    block, x, last_state)
+                output_x, new_state = deepspeed_checkpoint(
+                    block, output_x, last_state)
             else:
-                x, new_state = block(x, last_state)
+                output_x, new_state = block(output_x, last_state)
             new_states[i] = new_state
 
-        x = self.ln_out(x)
+        ########
+        ### Forking block loop (its slower sadly)
+        #######
 
-        x = self.head(x)
+        # # Configuring the chunk sizes
+        # first_round_chunk_size = 256
+        
+        # # Next round chunk sizes forumlation
+        # def nextRoundChunkSize(t):
+        #     return first_round_chunk_size
 
-        return x, new_states.shift_states, new_states.wkv_states
+        # # First round, first block
+        # def firstRound_firstBlock_subProcess(
+        #         block:Block, last_state:BlockState, 
+        #         in_x:torch.tensor, grad_cp):
+        #     if grad_cp:
+        #         out_x, new_state = deepspeed_checkpoint(
+        #             block, in_x, last_state)
+        #     else:
+        #         out_x, new_state = block(in_x, last_state)
+        #     return out_x, new_state
+            
+        # # First round, next block
+        # def firstRound_nextBlock_subProcess(
+        #         block:Block, last_state:BlockState, 
+        #         in_x_promise: torch.jit.Future[torch.Tensor], 
+        #         grad_cp):
+        #     in_x, prv_layer_state = torch.jit.wait(in_x_promise)
+        #     return firstRound_firstBlock_subProcess(block, last_state, in_x, grad_cp)
+        
+        # # Next round, sub process
+        # def nextRound_firstBlock_subProcess(
+        #     block:Block, last_state_promise: torch.jit.Future[BlockState],
+        #     in_x:torch.Tensor, grad_cp):
+        #     last_x, last_state = torch.jit.wait(last_state_promise)
+        #     return firstRound_firstBlock_subProcess(block, last_state, in_x, grad_cp)
+    
+        # # Next round, next block
+        # def nextRound_nextBlock_subProcess(
+        #     block:Block, last_state_promise: torch.jit.Future[BlockState],
+        #     in_x_promise: torch.jit.Future[torch.Tensor], 
+        #     grad_cp):
+        #     last_x, last_state = torch.jit.wait(last_state_promise)
+        #     in_x, prv_layer_state = torch.jit.wait(in_x_promise)
+        #     return firstRound_firstBlock_subProcess(block, last_state, in_x, grad_cp)
+
+        # # Final x value futures
+        # output_x_futures = []
+        
+        # # Highly experimental first round token pass with JIT fork
+        # first_round_futures = []
+        # for i in range(len(self.blocks)):
+        #     if i == 0:
+        #         future = torch.jit.fork(
+        #             firstRound_firstBlock_subProcess, self.blocks[i], 
+        #             cur_bs_list[i], x[:,:first_round_chunk_size], self.grad_cp
+        #         )
+        #     else:
+        #         future = torch.jit.fork(
+        #             firstRound_nextBlock_subProcess, self.blocks[i], 
+        #             cur_bs_list[i], first_round_futures[i-1], self.grad_cp
+        #         )
+        #     first_round_futures.append(future)
+        # output_x_futures.append(first_round_futures[-1])
+
+        # # Lets start doing the next round iterations
+        # next_round_futures = first_round_futures
+
+        # # Lets start the next round iterations
+        # idx = first_round_chunk_size
+        # while idx < T:
+        #     increment = nextRoundChunkSize(idx)
+        #     for i in range(len(self.blocks)):
+        #         if i == 0:
+        #             future = torch.jit.fork(
+        #                 nextRound_firstBlock_subProcess, self.blocks[i], 
+        #                 next_round_futures[i], x[:,idx:idx+increment], self.grad_cp
+        #             )
+        #         else:
+        #             future = torch.jit.fork(
+        #                 nextRound_nextBlock_subProcess, self.blocks[i], 
+        #                 next_round_futures[i], next_round_futures[i-1], self.grad_cp
+        #             )
+        #         next_round_futures[i] = future
+        #     output_x_futures.append(next_round_futures[-1])
+        #     idx += increment
+
+        # # Lets get the new states from the final round futures
+        # for i in range(len(self.blocks)):
+        #     tmp_x, new_state = torch.jit.wait(next_round_futures[i])
+        #     new_states[i] = new_state
+        
+        # # Lets process the final output_x_futures
+        # output_x, tmp_state = torch.jit.wait(output_x_futures[0])
+        # for i in range(1, len(output_x_futures)):
+        #     tmp_x, tmp_state = torch.jit.wait(output_x_futures[i])
+        #     output_x = torch.cat((output_x, tmp_x), dim=1)
+        # output_x = output_x[:, :T]
+
+        # Final layernorm and head output
+        output_x = self.ln_out(output_x)
+        output_x = self.head(output_x)
+
+        return output_x, new_states.shift_states, new_states.wkv_states
 
     #
     # Custom overwrite of manual_backwards operation, to skip the "manual_backwards"
@@ -986,6 +778,14 @@ class RWKV(L.LightningModule):
     # Main compute_loss function, this is called by the trainer loop
     #
     def compute_loss(self, batch, batch_idx, is_training_run: bool):
+
+        # Used for token/second performance tracking
+        if self._counting_tokens is None or batch_idx == 0:
+            self._counting_tokens = 0
+        if self._counting_time_start is None or batch_idx == 0:
+            self._counting_time_start = time.time()
+        
+        # Get the input sequence, and attention mask
         seq = batch['input_ids']
         assert isinstance(seq, torch.Tensor) and seq.ndim == 2
         ori_seq_mask = batch['attention_mask']
@@ -994,17 +794,30 @@ class RWKV(L.LightningModule):
         if ori_seq_mask is None or ori_seq_mask.ndim != 2:
             ori_seq_mask = torch.ones_like(seq[:, 1:])
 
+        # Initialize the total_mask_sum (but not compute it)
+        total_mask_sum = 0
+
+        # Number of GPUs used in training, note that if it is > 1
+        # it is requried that all operations here are in sync with
+        # all other GPUs, as such "quick return" on this function
+        # should not be allowed
+        num_devices = self.trainer.num_devices
+
+        ### ---
+        ### Positional loss bias handling
+        ### ---
+        
         # Get the starting and ending loss bias
         loss_bias_start = self.position_loss_bias
         loss_bias_end   = 2.0 - loss_bias_start
-
-        # total_mask_sum
-        total_mask_sum = torch.sum(ori_seq_mask)
 
         # Skip loss bias calculation, if loss_bias_start is 1.0
         if loss_bias_start == 1.0 or (is_training_run == False and self.position_loss_bias_in_validation == False):
             seq_mask = ori_seq_mask
         else:
+            # Lets get the torch mask sum
+            total_mask_sum = torch.sum(ori_seq_mask)
+
             # Lets get a linear multiplier for the loss bias
             # seq_mask_sum = torch.sum(ori_seq_mask)
             bias_mask = torch.linspace(loss_bias_start, loss_bias_end, int(total_mask_sum.item()), device=ori_seq_mask.device)
@@ -1019,12 +832,18 @@ class RWKV(L.LightningModule):
             # And save it as seq_mask
             seq_mask = final_mask.unsqueeze(0)
 
+        ### ---
+        ### Training cutoff logic handling 
+        ### ---
+        
         # Perform cutoff for training run
         if is_training_run:
             prev_step = 0
 
             # Avoid using the zip operation, as torch.compile throws an exception on it
             # with `zip not reconized as a valid function`
+            # 
+            # This skip if ctx_len_warmup_steps/ctx_len_cutoffs is not set
             # ---
             # for step, len_cut in zip(self.ctx_len_warmup_steps,
             #                          self.ctx_len_cutoffs):
@@ -1047,23 +866,35 @@ class RWKV(L.LightningModule):
                     seq_mask[:, :pos] = 0
                     break
                 prev_step = step
-                
+        
+        ### ---
+        ### Various size checking, and implementing the core checkpoint_step
+        ### ---
+        
+        # BPTT, and training steps, and various size fetching
         do_bptt_learning = self.bptt_learning and is_training_run
         idx, targets = seq[:, :-1], seq[:, 1:]
-
         B, T = idx.shape
         C = self.n_embd
-        total_mask_sum = torch.sum(seq_mask)
 
         # If total_mask_sum, we skip, as there is no tokens of value to learn from anyway
-        if total_mask_sum == 0:
+        total_mask_sum = torch.sum(seq_mask)
+        # Do a quick return, if there is no tokens of value to learn from due to full masking
+        if num_devices > 1 and total_mask_sum == 0:
             return 0
         
+        # Checkpoint steps
         def checkpointed_step(idx, targets, mask, prev_loss, last_shift_states,
                               last_wkv_states, prev_steps):
             logits, new_shift_states, new_wkv_states = self(
                 idx, last_shift_states, last_wkv_states)
             
+            # Ensure logits, targets, and mask are contiguous
+            # this is required to avoid view is not compatible with size and stride error
+            logits = logits.contiguous()
+            targets = targets.contiguous()
+            mask = mask.contiguous()
+
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)),
                                     targets.view(-1),
                                     reduction="none")
@@ -1077,14 +908,17 @@ class RWKV(L.LightningModule):
             new_loss = prev_loss + loss
             return new_loss, new_shift_states, new_wkv_states, new_steps
 
-        total_loss = torch.tensor(
-            0, dtype=self.emb.weight.dtype).requires_grad_()
+        total_loss = torch.tensor(0, dtype=self.emb.weight.dtype).requires_grad_()
         steps = 0
         states = BlockStateList.create(self.n_layer, B, C, 
                                        self.n_head, self.head_size,
                                        seq.device, self.emb.weight.dtype)
         segment_count = math.ceil(T / self.ctx_len)
 
+        ### ---
+        ### Learning process logic (BPTT or not)
+        ### ---
+        
         #
         # BPTT learning, we split the sequence into segments
         # and perform a backward pass for each segment, on its own.
@@ -1120,12 +954,12 @@ class RWKV(L.LightningModule):
             # it also helps ensure the segment cutoff points are more varied, across mixed dataset sizes
             # and avoid potentially undesired training behaviour at fixed cutoff points
             # (this only applies for segmented learning)
-            segment_size = min(math.ceil(T / segment_count), self.ctx_len)
+            segment_size = min(math.ceil(T / segment_count)+1, self.ctx_len)
 
-            # Dummy 2D tenros of shape [1,1], are used to do "dummy checkpoint/forward/backprop" to keep everything in sync
+            # Dummy 2D tensor of shape [1,1], are used to do "dummy checkpoint/forward/backprop" to keep everything in sync
             dummy_2d_zero = torch.tensor([[0]], dtype=torch.long, device=cur_device)
 
-            # Get the max segment count across all GPUs, in the current batch, which is used to keep all devices are in sync
+            # Get the max segment count across all GPUs, in the current substep, which is used to keep all devices are in sync
             # Once a thread has completed all its segments, it will do dummy checkpoint/forward/backprop with one token,
             # and stay in sync with the thread that are still working on their segments
             #
@@ -1151,8 +985,8 @@ class RWKV(L.LightningModule):
                     # ---
                     # we map it to be a tensor, instead of the int directly, as this is more reliable across certain versions of torch/lightning
                     # https://discord.com/channels/992359628979568762/1148755392638234697/1148821863749931008
-                    forward_segment_count  = self.trainer.strategy.reduce(torch.Tensor([segment_count]).to(dtype=torch.int, device=cur_device), reduce_op="max")
-                    
+                    forward_segment_count  = self.trainer.strategy.reduce(torch.Tensor([segment_count]).to(torch.int), reduce_op="max")
+
                     # Convert to int, if its a torch tensor
                     if isinstance(forward_segment_count, torch.Tensor):
                         forward_segment_count = forward_segment_count.item()
@@ -1175,9 +1009,9 @@ class RWKV(L.LightningModule):
 
             # We compute when we start the segmented learning process
             if forward_segment_count != backward_segment_count:
-                start_learning_segment = max(segment_count - self.bptt_learning_range, 0);
+                start_learning_segment = max(segment_count - self.bptt_learning_range, 0)
             else:
-                start_learning_segment = 0;
+                start_learning_segment = 0
 
             # # Segment loss array to track (and reduce later)
             # # of size equal to forward_segment_count
@@ -1314,24 +1148,47 @@ class RWKV(L.LightningModule):
                 gc.collect()
                 # torch.cuda.empty_cache()
 
-        # Wandb logging only, if an active run exists
-        if wandb.run is not None:
+        # Wandb logging only, if an active run exists (only applies for training)
+        if wandb.run is not None and is_training_run:
             global_rank = self.global_rank
             global_device_count = self.trainer.num_devices * self.trainer.num_nodes
+
+            # Get the total dataset context length
+            batch_ctx_len = 0
+            if "data_ctx_len" in batch:
+                batch_ctx_len = torch.sum(batch["data_ctx_len"]).item()
+            else:
+                batch_ctx_len = T * self.trainer.microbatch_size
+
+            # Increment the counting tokens, and log it accordingly
+            self._counting_tokens += batch_ctx_len
+
+            # Log the line values
             wandb.log({
-                'substep': batch_idx * global_device_count + global_rank,
-                'batchidx': batch_idx,
                 'global_rank': global_rank, 
-                'real_ctx_len': T, 
+                'data_ctx_len': batch_ctx_len / self.trainer.microbatch_size, 
                 'train/loss': total_loss,
+                f'perf/tokens_total.gpu.{global_rank}': self._counting_tokens,
+                f'perf/tokens_per_sec.gpu.{global_rank}': self._counting_tokens / max(time.time() - self._counting_time_start, 1),
+                'substep': (batch_idx * global_device_count + global_rank),
                 'trainer/global_step':self.global_step,
-                'trainer/learning_rate': self.trainer.optimizers[0].param_groups[0]['lr']
+                'trainer/learning_rate': self.trainer.optimizers[0].param_groups[0]['lr'],
+                'batchidx': batch_idx
             })
 
+        # Throw if total loss is NaN
+        assert not torch.isnan(total_loss), "total_loss is NaN"
         return total_loss
 
+    #
+    # Training and validation steps
+    #
     @TCompileBaseline
     def training_step(self, batch, batch_idx):
+
+        # print("=== BATCH ID SHAPE ===", batch["input_ids"].shape)
+        # print("=== BATCH AM SHAPE ===", batch["attention_mask"].shape)
+
         total_loss = self.compute_loss(batch, batch_idx, True)
 
         self.log('train/loss', total_loss, prog_bar=True)
@@ -1351,9 +1208,9 @@ class RWKV(L.LightningModule):
         self.log('validation/loss', total_loss, prog_bar=True, sync_dist=True)
         return total_loss
 
-########################################################################################################
+### ---
 # SimpleRWKV, a wrapper for RWKV that allows for simple usage of the model
-########################################################################################################
+### ---
 
 # SimpleRWKV specific imports
 from transformers import PreTrainedTokenizerFast

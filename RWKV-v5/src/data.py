@@ -1,6 +1,8 @@
 from lightning import LightningDataModule
 
+import torch
 from torch.utils.data import DataLoader
+from torch.utils.data import DistributedSampler
 
 import wandb
 from datasets import load_from_disk, load_dataset, Dataset
@@ -292,10 +294,15 @@ def prepare_data_static(**kargs):
                             input_ids += column_encodings['input_ids']
                             token_type_ids += column_encodings['token_type_ids']
 
-                            # Override the training attention mask if masking is set to false
-                            if len(multi_column_train_mask) < i and multi_column_train_mask[i] is False:
+                            # Configure the attention masks accordingly
+                            if i > len(multi_column_train_mask):
+                                # If the corresponding `multi_column_train_mask` is not set, we will assume as valid training data
+                                attention_mask += ([1] * len(column_encodings['input_ids']))
+                            elif multi_column_train_mask[i] is False:
+                                # If the `multi_column_train_mask` is set, but configured as false, we should not pay attention to it
                                 attention_mask += ([0] * len(column_encodings['input_ids']))
-                            else:
+                            else: # multi_column_train_mask[i] is True
+                                # This means it is true, lets pay attention once again
                                 attention_mask += ([1] * len(column_encodings['input_ids']))
                                 
                             # Add the suffix
@@ -359,7 +366,8 @@ def prepare_data_static(**kargs):
         src_dataset = src_dataset.remove_columns(list(dataset_features_to_remove.keys()))
         
         # Get the newline token
-        newline_tokenSet = encodeTokens(["\n"])
+        endOfDoc_tokenSet = encodeTokens(["\n"])
+        endOfDoc_tokenSet["input_ids"][0][0] = 0
 
         # See if rechunking is needed, this is useful mostly for "text" based datasets
         # where we would need to split them into "digestable" context length sizes 
@@ -378,9 +386,9 @@ def prepare_data_static(**kargs):
                 # Get the respective values and push them to the 
                 # raw value array, effectively merging the arrays together
                 # with the newline token in between
-                full_input_ids += x["input_ids"][i] + newline_tokenSet["input_ids"][0]
-                full_token_type_ids += x["token_type_ids"][i] + newline_tokenSet["token_type_ids"][0]
-                full_attention_mask += x["attention_mask"][i] + newline_tokenSet["attention_mask"][0]
+                full_input_ids += x["input_ids"][i] + endOfDoc_tokenSet["input_ids"][0]
+                full_token_type_ids += x["token_type_ids"][i] + endOfDoc_tokenSet["token_type_ids"][0]
+                full_attention_mask += x["attention_mask"][i] + endOfDoc_tokenSet["attention_mask"][0]
             
             # Total length, and sample count
             # note that thte "remainder" will be discarded
@@ -411,12 +419,6 @@ def prepare_data_static(**kargs):
             }
             return ret
 
-        # Perform rechunking if needed for "text" based datasets
-        if kargs["source"] == "text" and kargs["text_rechunk_size"] > 0:
-            src_dataset = src_dataset.map(rechunk_text, batched=True, 
-                                        batch_size=kargs["text_rechunk_size"]*10,
-                                        num_proc=num_cpus)
-        
         # Remove empty datasets (it causes an error otherwise)
         # and perform min/max length filtering (if configured)
         def dataset_filter(x):
@@ -430,19 +432,12 @@ def prepare_data_static(**kargs):
             return True
         src_dataset = src_dataset.filter(dataset_filter, num_proc=num_cpus)
         
-        # Perform a sort by length
-        if kargs["sort_by_length"]:
-            sort_asc = kargs["sort_asc"]
-            
-            def add_length(example):
-                example["length"] = len(example['input_ids'])
-                return example
-            
-            src_dataset = src_dataset.map(add_length)
-            
-            # sort by length (not sorting the columns, just the rows)
-            src_dataset = src_dataset.sort("length", reverse=not sort_asc)
-
+        # Perform rechunking if needed for "text" based datasets
+        if kargs["source"] == "text" and kargs["text_rechunk_size"] > 0 and kargs["text_rechunk_auto"]:
+            src_dataset = src_dataset.map(rechunk_text, batched=True, 
+                                        batch_size=kargs["text_rechunk_size"]*10,
+                                        num_proc=num_cpus)
+        
         # Perform rechunking after filtering, if source is not a "text" based 
         # dataset and text_rechunk_force is enabled
         if kargs["source"] != "text" and kargs["text_rechunk_size"] > 0 and kargs["text_rechunk_force"]:
@@ -462,9 +457,91 @@ def prepare_data_static(**kargs):
                 seed=42 #Fixed seed, to prevent train/test reshuffling between test runs
             )
         
+        # Perform a sort by length, only after test split
+        if kargs["sort_by_length"]:
+            sort_asc = kargs["sort_asc"]
+            
+            def add_length(example):
+                example["input_length"] = len(example['input_ids'])
+                return example
+            
+            src_dataset['train'] = src_dataset['train'].map(add_length, batched=False, num_proc=num_cpus)
+            
+            # sort by length (not sorting the columns, just the rows)
+            src_dataset['train'] = src_dataset['train'].sort("input_length", reverse=not sort_asc)
+
+        # If an int value is used, it is interprated as document count
+        # If a floating value (<1.0) is used, it is interprated as a percentage of the dataset
+        if kargs["dataset_offset"] > 0 or kargs["dataset_length"] > 0:
+            # src dataset length
+            train_length = len(src_dataset["train"])
+
+            # Compute the offset position
+            offset_val = kargs["dataset_offset"]
+
+            # If offset is a float, we will use it as a percentage
+            if offset_val < 0:
+                offset_val = 0
+            if offset_val > 0 and offset_val < 1.0:
+                offset_val = int(train_length * offset_val) # Rounded down value
+
+            # Compute the length position
+            length_val = kargs["dataset_length"]
+            if length_val < 0:
+                length_val = train_length - offset_val
+            if length_val > 0 and length_val < 1.0:
+                length_val = int(train_length * length_val)
+            if length_val > (train_length - offset_val):
+                length_val = (train_length - offset_val)
+
+            # Get the subset of the dataset
+            src_dataset["train"] = src_dataset["train"].select(range(offset_val, offset_val + length_val))
+
         # Save the dataset to disk
         src_dataset.save_to_disk(kargs["data_path"])
 
+# Dataloader collator for merging multiple dataset records together
+# we use token 0 for padding, with a learning mask value of 0
+def dataloader_collator_fn(records):
+    # Get the maximum number of records 
+    # (aka the batch size)
+    records_len = len(records)
+    
+    # Compute the total length of the records
+    input_ids_len = 0
+    token_type_ids_len = 0
+    attention_mask_len = 0
+
+    # Loop through the records and compute the max length
+    for i in range(records_len):
+        input_ids_len = max(input_ids_len, len(records[i]["input_ids"]))
+        token_type_ids_len = max(token_type_ids_len, len(records[i]["token_type_ids"]))
+        attention_mask_len = max(attention_mask_len, len(records[i]["attention_mask"]))
+
+    # First row of the records
+    first_row = records[0]
+
+    # Create the output arrays, with the default 0 values (no learning mask)
+    out_input_ids = torch.zeros((records_len, input_ids_len), dtype=first_row["input_ids"].dtype)
+    out_token_type_ids = torch.zeros((records_len, token_type_ids_len), dtype=first_row["token_type_ids"].dtype)
+    out_attention_mask = torch.zeros((records_len, attention_mask_len), dtype=first_row["attention_mask"].dtype)
+    out_data_ctx_len = torch.zeros((records_len), dtype=torch.int32)
+
+    # Loop through the records and copy the values to the output arrays
+    for i in range(records_len):
+        out_input_ids[i][:len(records[i]["input_ids"])] = records[i]["input_ids"]
+        out_token_type_ids[i][:len(records[i]["token_type_ids"])] = records[i]["token_type_ids"]
+        out_attention_mask[i][:len(records[i]["attention_mask"])] = records[i]["attention_mask"]
+        out_data_ctx_len[i] = len(records[i]["input_ids"])
+    
+    # Build & return the output object
+    out = {
+        'input_ids': out_input_ids,
+        'token_type_ids': out_token_type_ids,
+        'attention_mask': out_attention_mask,
+        'data_ctx_len': out_data_ctx_len
+    }
+    return out
 
 class RWKVDataModule(LightningDataModule):
     def __init__(
@@ -482,6 +559,7 @@ class RWKVDataModule(LightningDataModule):
         test_split_shuffle: bool = False,
         # Text rechunking size
         text_rechunk_size: int = 4096,
+        text_rechunk_auto: bool = True,
         text_rechunk_force: bool = False,
         # ---
         # Tokenizer settings
@@ -504,9 +582,12 @@ class RWKVDataModule(LightningDataModule):
         sort_by_length: bool = False,
         sort_asc: bool = True,
 
+        # Dataloader shuffling, disabled if "sort_by_length" is enabled
+        training_dataloader_shuffle_auto: bool = True,
+
         # Dataset offset and limit controls
-        dataset_offset: int = -1,
-        dataset_length: int = -1,
+        dataset_offset: float = -1,
+        dataset_length: float = -1,
         
         # Custom 'text' column to support, mostly used for dataset where the 
         # desired train data is in another column (eg. 'code')
@@ -532,6 +613,8 @@ class RWKVDataModule(LightningDataModule):
         super().__init__()
         self.data_path = data_path
         self._loaded_dataset = None
+        self.sort_by_length = sort_by_length
+        self.training_dataloader_shuffle_auto = training_dataloader_shuffle_auto
 
         # Log to wandb
         if wandb.run is not None:
@@ -553,9 +636,54 @@ class RWKVDataModule(LightningDataModule):
     # Return the train dataloader
     def train_dataloader(self):
         self._internal_setup()
-        return DataLoader(self._loaded_dataset['train'], num_workers=num_workers)
+        dataset = self._loaded_dataset['train'];
+        sampler = DistributedSampler(
+            dataset, 
+            shuffle=self.training_dataloader_shuffle_auto and not self.sort_by_length,
+            num_replicas=self.trainer.world_size,
+            rank=self.trainer.global_rank,
+        )
+
+        microbatch_size = 1
+        if hasattr(self, "trainer") and hasattr(self.trainer, "microbatch_size"):
+            microbatch_size = self.trainer.microbatch_size
+
+        return DataLoader(
+            dataset, 
+            sampler=sampler,
+            shuffle=False,
+            # 4 prefetch workers per GPU
+            num_workers=4, 
+            # Prefetching 8 batches
+            prefetch_factor=8,
+            # Of batch size 1 datasets
+            batch_size=microbatch_size, 
+            # The collation function
+            collate_fn=dataloader_collator_fn,
+            # Pinned in GPU memory
+            pin_memory=True
+        )
     
     # Return the validation dataloader
     def val_dataloader(self):
         self._internal_setup()
-        return DataLoader(self._loaded_dataset['test'], num_workers=num_workers)
+        dataset = self._loaded_dataset['test'];
+        sampler = DistributedSampler(
+            dataset, 
+            shuffle=False, 
+            num_replicas=self.trainer.world_size,
+            rank=self.trainer.global_rank,
+        )
+        return DataLoader(
+            dataset, 
+            sampler=sampler,
+            shuffle=False,
+            # 4 prefetch workers per GPU
+            num_workers=4, 
+            # Prefetching 8 batches
+            prefetch_factor=8,
+            # Of batch size 1 datasets
+            batch_size=1, 
+            # Pinned in GPU memory
+            pin_memory=True
+        )
