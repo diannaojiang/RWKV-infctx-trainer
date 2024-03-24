@@ -2,13 +2,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from typing import List,Dict,Tuple
+from typing import tuple
 from torch import Tensor
 
 from .CoreDependencies import *
 
 @TCompileBaseline
-def rwkv_inner(r,k,v,w,u,kv_state,chunk_len:int=128,precision:int=64)->Tuple[Tensor,Tensor]:
+def rwkv_inner(r,k,v,w,u,kv_state,chunk_len:int=128,precision:int=64)->tuple[Tensor,Tensor]:
     assert(chunk_len <= 24 or precision == 64)
     """
     expects

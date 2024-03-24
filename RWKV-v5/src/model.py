@@ -3,7 +3,7 @@
 ### ---
 
 global RWKV_JIT_ON, RWKV_TORCH_COMPILE, RWKV_NO_CUDA
-
+from typing import List,Dict,Tuple
 from .module.CoreDependencies import *
 from .module.ChannelMix import RWKV_ChannelMix
 from .module.TimeMix import RWKV_TimeMix
@@ -26,7 +26,7 @@ def deepspeed_checkpoint(*args, **kwargs):
 
 class BlockState:
 
-    def __init__(self, time_mix_state: tuple[torch.Tensor,torch.Tensor],
+    def __init__(self, time_mix_state: Tuple[torch.Tensor,torch.Tensor],
                  channel_mix_state: torch.Tensor):
         self.time_mix_state = time_mix_state
         self.channel_mix_state = channel_mix_state

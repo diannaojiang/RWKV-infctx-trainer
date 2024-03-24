@@ -3,6 +3,7 @@ from .CoreDependencies import *
 from .OptimizedOps import modified_lerp
 from .rwkv_inner import rwkv_inner
 import os
+from typing import List,Dict,Tuple
 
 # Current code file path
 code_file_path = os.path.realpath(__file__)
@@ -243,10 +244,13 @@ class RWKV_TimeMix(JITModClass):
                 ],
                 verbose=True,
                 extra_cuda_cflags=[
-                    "-res-usage", 
-                    "--use_fast_math", 
-                    "-O3", "-Xptxas -O3", 
-                    "--extra-device-vectorization", 
+                    "-std=c++17",
+                    # "-res-usage", 
+                    # "--use_fast_math", 
+                    "-ffast-math",
+                    "-O3",
+                    "-Xptxas -O3", 
+                    # "--extra-device-vectorization", 
                     f"-D_N_={HEAD_SIZE}"
                 ]
             )
@@ -273,7 +277,7 @@ class RWKV_TimeMix(JITModClass):
     #       [batch_size, state_size] ## Channel mix state,
     #       [batch_size, n_head, head_size, head_size] ## WKV state
     #   ]
-    def forward(self, x, last_state: tuple[torch.Tensor,torch.Tensor]) -> tuple[torch.Tensor,tuple[torch.Tensor,torch.Tensor]]:
+    def forward(self, x, last_state: Tuple[torch.Tensor,torch.Tensor]) -> Tuple[torch.Tensor,Tuple[torch.Tensor,torch.Tensor]]:
         # Run with cuda
         if self.use_cuda is True:
            return self._forward_cuda(x, last_state)
@@ -282,7 +286,7 @@ class RWKV_TimeMix(JITModClass):
         return self._forward_nocuda_optimized(x, last_state)
 
     @JITModMethod
-    def _forward_cuda(self, x, last_state: tuple[torch.Tensor,torch.Tensor]) -> tuple[torch.Tensor,tuple[torch.Tensor,torch.Tensor]]:
+    def _forward_cuda(self, x, last_state: Tuple[torch.Tensor,torch.Tensor]) -> Tuple[torch.Tensor,Tuple[torch.Tensor,torch.Tensor]]:
         # Get the x sizing
         B, T, C = x.size()
         H = self.n_head
@@ -322,7 +326,7 @@ class RWKV_TimeMix(JITModClass):
         return (x_logits, (x[:,-1],state))
 
     @JITModMethod
-    def _forward_nocuda_optimized(self, x, last_state: tuple[torch.Tensor,torch.Tensor]) -> tuple[torch.Tensor,tuple[torch.Tensor,torch.Tensor]]:
+    def _forward_nocuda_optimized(self, x, last_state: Tuple[torch.Tensor,torch.Tensor]) -> Tuple[torch.Tensor,Tuple[torch.Tensor,torch.Tensor]]:
         shift_state_out = x[:,-1]
 
         assert x.size(-2) % self.chunk_len == 0, "fast non-cuda rwkv5.2+ requires ctxlen to be an exact multiple of chunk_len"

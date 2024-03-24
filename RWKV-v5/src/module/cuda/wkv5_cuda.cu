@@ -30,8 +30,8 @@ __global__ void kernelc_mm8_one(
     for (unsigned long long token = 0; token < tokenlength; token++)
     {
         const unsigned long long k = blockIdx.y * blockDim.y + threadIdx.y;
-        const unsigned long long j0 = min(N, blockIdx.x * ((N + MM8_ONE_JSPLIT - 1) / MM8_ONE_JSPLIT));
-        const unsigned long long j1 = min(N, (blockIdx.x + 1) * ((N + MM8_ONE_JSPLIT - 1) / MM8_ONE_JSPLIT));
+        const unsigned long long j0 = std::min(N, blockIdx.x * ((N + MM8_ONE_JSPLIT - 1) / MM8_ONE_JSPLIT));
+        const unsigned long long j1 = std::min(N, (blockIdx.x + 1) * ((N + MM8_ONE_JSPLIT - 1) / MM8_ONE_JSPLIT));
 
         if (k < M)
         {
